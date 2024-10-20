@@ -1,4 +1,5 @@
-# Sparsity Enabled Parameter Sharing (SParS) from the paper: Learning Parameter Sharing with Tensor Decompositions and Sparsity
+# Sparsity Enabled Parameter Sharing (SParS)
+## Paper: Learning Parameter Sharing with Tensor Decompositions and Sparsity
 Research on model compression via parameter sharing, sparsity, parameter sharing, and parameter efficient fine-tuning.
 
 ## Getting Started
