@@ -1,5 +1,5 @@
-# SD2S: SparseDecompositions2Share
-Research on model compression via sparsity & parameter sharing and parameter efficient fine-tuning.
+# Sparsity Enabled Parameter Sharing (SParS) from the paper: Learning Parameter Sharing with Tensor Decompositions and Sparsity
+Research on model compression via parameter sharing, sparsity, parameter sharing, and parameter efficient fine-tuning.
 
 ## Getting Started
 ### Installation
