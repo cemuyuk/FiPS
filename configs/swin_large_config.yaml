@@ -1,0 +1,90 @@
+defaults:
+  - data: pets
+  - _self_
+
+training: 
+  num_epochs: 20
+  use_cuda: True
+  task: ImageClassification
+  seed: 7
+  validation_interval: 2
+  hooks:
+    in_place: False
+    single: False
+    embedding_key: norm_pre
+    fqn_prefix: blocks
+    num_batches: 5
+    batch_train: True
+    optimal_steps: 600
+
+
+model:
+  name: swin_large_patch4_window7_224
+  pretrained: True
+  path: ./training/models/swin_large_patch4_window7_224.pth
+  checkpoint_path: ./training/models/compressed_model_j9a7efab.pt
+  kwargs:
+    p_budget: 0.5
+    emb_fqn: patch_embed
+    block_fqn_prefix: blocks
+    layer_fqn_suffixes: [fc1, fc2]
+    normalization:
+      in_place: True
+      fqn: downsample
+      apply_before_idx: [0, 2, 4, 22]
+    block_group_indices:
+      block_group_1: [0, 1]
+      block_group_2: [2, 3]
+      block_group_3: [4, 5, 6, 7, 8, 9]
+      block_group_4: [10, 11, 12, 13, 14, 15]
+      block_group_5: [16, 17, 18, 19, 20, 21]
+      block_group_6: [22, 23]
+    concat_axis: 1
+    mask: True
+    base_requires_grad: True
+
+
+optimizer:
+  name: AdamW
+  label_smoothing: 0.11
+  kwargs:
+    lr: 1.0e-35
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    eps: 9.999e-9 # effectively this is 1e-8
+    amsgrad: False
+  scheduler:
+    name: CosineAnnealingLR
+    kwargs: 
+      T_max: 0 # being overriden in main.py
+      eta_min: 1.0e-6  # effectively this is 1e-6
+
+
+sparsifier:
+  name: rigl
+  sparsity: 0.75
+  grown_weights_init: 0
+  pruning_ratio: 0.1
+  t_accel: 240
+  initial_sparsity: 0.05
+  final_sparsity: 0.75
+  accelerated_sparsity: 0.5
+  global_pruning: True
+  scheduler:
+    delta_t: 50
+    t_end_coeff: 0.75
+
+wandb:
+  ENABLE: True # Global switch for turning all wandb calls into no-ops, see ./src/package/utils/wandb_utils.py
+  run_id: null # Keep null for fresh runs, otherwise, set to run_id to load ckpt
+  name: ${model.name}-${sparsifier.name}-${data.name}-Finetune
+  project: SparseDecompositions2Share
+  entity: cem1
+  start_method: thread
+  log_images: False # If True, log images when relevant to ML task
+
+paths:
+  artefacts: ./artefacts/
+  logs: ${paths.artefacts}/logs/
+  models: ${paths.artefacts}/models/
+  

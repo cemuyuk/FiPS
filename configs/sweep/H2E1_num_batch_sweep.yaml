@@ -1,0 +1,16 @@
+program: ./training/main.py
+method: grid
+project: SparseDecompositions2Share
+name: Dense-AdamW-nBatch-Sweep
+metric:
+  goal: maximize
+  name: accuracy
+parameters:
+  training.hooks.num_batches: 
+    values: [10, 20, 40, 80] # tie with n_epoch. multiplication should yield 500
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}

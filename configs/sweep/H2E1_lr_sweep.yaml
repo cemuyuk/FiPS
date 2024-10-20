@@ -1,0 +1,16 @@
+program: ./training/main.py
+method: grid
+project: SparseDecompositions2Share
+name: Dense-AdamW-LR-Sweep
+metric:
+  goal: maximize
+  name: accuracy
+parameters:
+  optimizer.kwargs.lr: 
+    values: [3.1250e-05, 6.2500e-05, 1.2500e-04, 2.5000e-04, 5.0000e-04]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}

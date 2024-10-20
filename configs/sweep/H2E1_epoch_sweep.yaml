@@ -1,0 +1,16 @@
+program: ./training/main.py
+method: grid
+project: SparseDecompositions2Share
+name: Dense-AdamW-Epoch-Sweep
+metric:
+  goal: maximize
+  name: accuracy
+parameters:
+  training.num_epochs: 
+    values: [5, 10, 20, 40, 80] # for 1200 steps, n_batch: 240, 120, 60, 30, 15
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}

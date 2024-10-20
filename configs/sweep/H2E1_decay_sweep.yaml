@@ -1,0 +1,16 @@
+program: ./training/main.py
+method: grid
+project: SparseDecompositions2Share
+name: Dense-AdamW-WeightDecay-Sweep
+metric:
+  goal: maximize
+  name: accuracy
+parameters:
+  optimizer.kwargs.weight_decay: 
+    values: [1e-2, 1e-1, 1, 10, 100]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}

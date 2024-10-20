@@ -1,0 +1,4 @@
+[submodule "third_party/sparsimony"]
+	path = third_party/sparsimony
+	url = https://github.com/mklasby/sparsimony
+	branch = main

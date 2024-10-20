@@ -1,0 +1,19 @@
+name: pets
+directory: ./data/Pets/
+num_classes: 100
+batch_size: 256
+num_workers: 8
+label_smoothing: 0.11
+record_top_5: True
+mixup_active: True
+transforms:
+  _RESIZE_X: 256
+  _RESIZE_Y: 480
+  _IMAGE_WIDTH: 224
+  _IMAGE_HEIGHT: 224
+  _HORIZONTAL_FLIP_P: 0.5
+  _MEAN_RGB: [0.485, 0.456, 0.406] #ImageNet
+  _STDDEV_RGB: [0.229, 0.224, 0.225] #ImageNet
+  three_augment: True
+  random_resized_crop_and_interpolation: True
+  color_jitter: 0.4

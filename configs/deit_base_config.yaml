@@ -1,0 +1,96 @@
+defaults:
+  - data: fake_imagenet
+  - _self_
+
+training: 
+  num_epochs: 200
+  use_cuda: True
+  task: ImageClassification
+  seed: 7
+  validation_interval: 2
+  hooks:
+    in_place: True # actually true for distil.py, this only prevents stratified sampling
+    single: False
+    embedding_key: norm_pre
+    fqn_prefix: blocks
+    num_batches: 30
+    batch_train: True
+    optimal_steps: 600
+
+
+model:
+  name: deit_base_patch16_224
+  pretrained: False
+  path: ./training/models/deit_base_patch16_224.pth
+  checkpoint_path: ./training/models/deit_gmp_pb50_zmxf938w.pt
+  kwargs:
+    p_budget: 0.5
+    emb_fqn: norm_pre
+    block_fqn_prefix: blocks
+    layer_fqn_suffixes: [fc1, fc2]
+    normalization:
+      in_place: False
+      fqn: None
+      apply_before_idx: None
+    block_group_indices:
+      block_group_1: [0, 1, 2, 3]
+      block_group_2: [4, 5, 6, 7]
+      block_group_3: [8, 9, 10, 11]
+    concat_axis: 1
+    mask: False
+    base_requires_grad: True
+
+
+optimizer:
+  name: AdamW
+  label_smoothing: 0.11
+  kwargs:
+    lr: 4.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    eps: 9.999e-9 # effectively this is 1e-8
+    amsgrad: False
+  scheduler:
+    name: CosineAnnealingLR
+    kwargs: 
+      T_max: 0 # being overriden in main.py
+      eta_min: 1.0e-5 # effectively this is 1e-6
+
+
+sparsifier:
+  name: srigl
+  sparsity: 0.5
+  global_pruning: True
+  grown_weights_init: 0
+  pruning_ratio: 0.1
+  t_accel: 240
+  initial_sparsity: 0.05
+  final_sparsity: 0.75
+  accelerated_sparsity: 0.5
+  scheduler:
+    delta_t: 50
+    t_end_coeff: 0.75
+
+
+wandb:
+  ENABLE: True # Global switch for turning all wandb calls into no-ops, see ./src/package/utils/wandb_utils.py
+  run_id: null # Keep null for fresh runs, otherwise, set to run_id to load ckpt
+  name: ${model.name}-${sparsifier.name}-${data.name}-${optimizer.kwargs.lr}-pb50-H2E11-SoftEntropy
+  project: SparseDecompositions2Share
+  entity: cem1
+  start_method: thread
+  log_images: False # If True, log images when relevant to ML task
+
+
+paths:
+  artefacts: ./artefacts/
+  logs: ${paths.artefacts}/logs/
+  models: ${paths.artefacts}/models/
+
+benchmarking:
+  latency: False
+  inference_profiling: True
+  training_profiling: False
+  param_budget: 0.90
+  compressed: True
+  compiled: False
