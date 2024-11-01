@@ -1,4 +1,4 @@
-# Sparsity Enabled Parameter Sharing (SParS)
+# FiPS (Fine-grained Parameter Sharing)
 ## Paper: Learning Parameter Sharing with Tensor Decompositions and Sparsity
 Research on model compression via parameter sharing, sparsity, parameter sharing, and parameter efficient fine-tuning.
 
