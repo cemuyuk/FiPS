@@ -1,13 +1,17 @@
 defaults:
-  - data: fake_imagenet
+  - data: inaturalist19
   - _self_
 
+hydra:
+  run:
+    dir: ./artefacts/hydra_outputs
+
 training: 
-  num_epochs: 200
+  num_epochs: 100
   use_cuda: True
   task: ImageClassification
   seed: 7
-  validation_interval: 2
+  validation_interval: 4
   hooks:
     in_place: True # actually true for distil.py, this only prevents stratified sampling
     single: False
@@ -23,7 +27,9 @@ model:
   pretrained: False
   path: ./training/models/deit_base_patch16_224.pth
   checkpoint_path: ./training/models/deit_gmp_pb50_zmxf938w.pt
+  # checkpoint_path: ./artefacts/models/compressed_model_zl5zbxx6.pt
   kwargs:
+    sparsity: 0.75
     p_budget: 0.5
     emb_fqn: norm_pre
     block_fqn_prefix: blocks
@@ -45,7 +51,7 @@ optimizer:
   name: AdamW
   label_smoothing: 0.11
   kwargs:
-    lr: 4.0e-4
+    lr: 1.0e-4
     weight_decay: 0.05
     betas: [0.9, 0.999]
     eps: 9.999e-9 # effectively this is 1e-8
@@ -58,15 +64,15 @@ optimizer:
 
 
 sparsifier:
-  name: srigl
-  sparsity: 0.5
+  name: rigl
+  sparsity: 0.75
   global_pruning: True
   grown_weights_init: 0
-  pruning_ratio: 0.1
+  pruning_ratio: 0.05
   t_accel: 240
   initial_sparsity: 0.05
-  final_sparsity: 0.75
-  accelerated_sparsity: 0.5
+  final_sparsity: 0.5
+  accelerated_sparsity: 0.30
   scheduler:
     delta_t: 50
     t_end_coeff: 0.75
@@ -75,7 +81,7 @@ sparsifier:
 wandb:
   ENABLE: True # Global switch for turning all wandb calls into no-ops, see ./src/package/utils/wandb_utils.py
   run_id: null # Keep null for fresh runs, otherwise, set to run_id to load ckpt
-  name: ${model.name}-${sparsifier.name}-${data.name}-${optimizer.kwargs.lr}-pb50-H2E11-SoftEntropy
+  name: ${model.name}-${sparsifier.name}-${optimizer.kwargs.lr}-inaturalist19-pb10
   project: SparseDecompositions2Share
   entity: cem1
   start_method: thread
@@ -89,8 +95,21 @@ paths:
 
 benchmarking:
   latency: False
-  inference_profiling: True
+  inference_profiling: False
   training_profiling: False
-  param_budget: 0.90
-  compressed: True
+  param_budget: 0.750
+  compressed: False
   compiled: False
+  to_csr: False
+  two_four: False
+  log_name: memory_log_bs_${benchmarking.batch_size}
+  embed_dim: 768
+  batch_size: null
+  fullgraph: True
+  output_dir: ./bench/logs/a100-fast-forward
+  device: cuda:0
+  num_threads: null
+  deepsparse: False
+  min_run_time: 20
+  fast_forward: False
+  dtype: float16

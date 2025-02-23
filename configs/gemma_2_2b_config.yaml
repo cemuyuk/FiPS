@@ -1,0 +1,102 @@
+hydra:
+  run:
+    dir: ./artefacts/hydra_outputs
+
+training: 
+  num_epochs: 40
+  use_cuda: True
+  task: TextGeneration
+  seed: 7
+  validation_interval: 2
+  hooks:
+    in_place: True
+    single: False
+    embedding_key: embed_tokens
+    fqn_prefix: layers
+    num_batches: 20
+    batch_train: True
+    optimal_steps: 600
+
+model:
+  name: google/gemma-2-2b
+  save_name: gemma2_2b
+  pretrained: True
+  path: ./training/models/gemma-2-2b.pth # ${oc.env:SLURM_TMPDIR}/models/deit_base_patch16_224.pth
+  checkpoint_path: ""
+  kwargs:
+    p_budget: 0.50
+    sparsity: 0.75
+    structured_sparsity: False
+    emb_fqn: patch_embed
+    block_fqn_prefix: layers
+    layer_fqn_suffixes: [up_proj, down_proj, gate_proj]
+    normalization:
+      in_place: False
+      fqn: None
+      apply_before_idx: None
+    block_group_indices:
+      block_group_1: [0, 1]
+      block_group_2: [2, 3, 4, 5, 6, 7, 8, 9]
+      block_group_3: [10, 11, 12, 13, 14, 15, 16, 17]
+      block_group_4: [18, 19, 20, 21, 22, 23, 24, 25]
+    concat_axis: 1
+    mask: True
+    base_requires_grad: True
+
+optimizer:
+  name: AdamW
+  label_smoothing: 0.11
+  kwargs:
+    lr: 3.125e-5
+    weight_decay: 0.05
+  scheduler:
+    name: CosineAnnealingLR
+    kwargs: 
+      T_max: 0 # being overriden in main.py
+      eta_min: 1.0e-5 # effectively this is 1e-6
+
+sparsifier:
+  name: sgmp
+  sparsity: 0.75
+  global_pruning: True
+  grown_weights_init: 0
+  pruning_ratio: 0.1
+  t_accel: 100
+  initial_sparsity: 0.05
+  final_sparsity: 0.75
+  accelerated_sparsity: 0.5
+  scheduler:
+    delta_t: 50
+    t_end_coeff: 0.75
+
+# TODO - check clip grad norm
+data:
+  name: redpajama
+  batch_size: 2048
+  num_workers: 2
+
+wandb:
+  ENABLE: True # Global switch for turning all wandb calls into no-ops, see ./src/package/utils/wandb_utils.py
+  run_id: null # Keep null for fresh runs, otherwise, set to run_id to load ckpt
+  name: ${model.name}-Global${sparsifier.global_pruning}-${sparsifier.name}-${optimizer.kwargs.lr}-pb0.5-arc
+  project: SparseDecompositions2Share
+  entity: cem1
+  start_method: thread
+  log_images: False # If True, log images when relevant to ML task
+
+paths:
+  data: 
+    directory: ./data/ImageNet/ # ${oc.env:SLURM_TMPDIR}
+    train: train
+    val: val
+  artefacts: ./artefacts/
+  logs: ${paths.artefacts}/logs/
+  models: ${paths.artefacts}/models/
+  
+benchmarking:
+  latency: False
+  inference_profiling: True
+  training_profiling: False
+  param_budget: 0.90
+  compressed: True
+  compiled: False

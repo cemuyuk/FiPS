@@ -1,12 +1,12 @@
 # TODO - attribution to DOJO for inspiration
-
 import math
 import re
 import os
+import gc
 import time
 import collections
 from functools import reduce
-from typing import Optional, Tuple, List, Dict
+from typing import Tuple, List, Dict
 from tqdm import tqdm
 import dotenv
 
@@ -33,7 +33,6 @@ from sparsimony.schedulers.base import (
     CosineDecayScheduler,
     AcceleratedCubicScheduler,
 )
-from sparsimony.dst.base import DSTMixin
 from sparsimony.dst.static import (
     StaticMagnitudeSparsifier,
 )
@@ -43,7 +42,7 @@ from sparsimony.dst.rigl import RigL
 from sparsimony.dst.srigl import NMSRigL
 
 from sd2s.lrm import SMLayer, SMModel
-from sd2s.utils import DDPWrappedGetAttr, get_world_size
+from sd2s.utils import DDPWrappedGetAttr
 
 from SETTINGS import CONFIG_DIR
 from training.wandb_utils import (
@@ -55,8 +54,8 @@ from training.wandb_utils import (
 
 
 @hydra.main(
-    config_path=CONFIG_DIR, 
-    config_name="gemma_2_2b_config", 
+    config_path=CONFIG_DIR,
+    config_name="gemma_2_2b_config_local_3",
     version_base="1.3",
 )
 def main(cfg: DictConfig):
@@ -69,7 +68,6 @@ def main(cfg: DictConfig):
             world_size=world_size,
             rank=global_rank,
         )
-
     device = _get_device(cfg, local_rank)
 
     # DATA
@@ -80,7 +78,7 @@ def main(cfg: DictConfig):
 
     # TOKENIZER
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
-    train_dataset, _ = _get_datasets(
+    train_dataset, validation_dataset = _get_datasets(
         cfg,
         tokenizer,
     )
@@ -102,6 +100,26 @@ def main(cfg: DictConfig):
     # each elements is <key, module>
     mlp_named_modules = filter(mlp_filter_fn, original_model.named_modules())
 
+    # WANDB LOGS RUN INIT
+    run = init_wandb(cfg, global_rank)
+    run_id = parse_wandb_run_id(run)
+
+    step = 0
+    original_model.eval()
+    perp = validate(
+        cfg=cfg,
+        tokenizer=tokenizer,
+        model=original_model,
+        dataset=wikitext_test,
+        step=step,
+        device=device,
+        log_wandb=False,
+    )
+    print(
+        f"Training Start - WikiText2 - Original Model Mean Perplexity: {perp['mean_perplexity']:.4f}"
+    )
+
+    print(f"Results for run ID: {run_id}:")
     original_model_activations = _get_k_activations(
         cfg=cfg,
         model=original_model,
@@ -115,54 +133,45 @@ def main(cfg: DictConfig):
     _set_gradient_false(original_model)
     _define_blocks(cfg, original_model)
     c_model = _get_compressed_model(cfg, original_model)
-    c_model.to(device)
 
     del original_model
     torch.cuda.empty_cache()
-    # OPTIMIZER, SCHEDULER, SPARSIFIER, T_END for SPARSIFIER, CRITERION
-    optimizer = _get_optimizer(cfg, c_model)
-    scheduler = _get_scheduler(cfg, optimizer)
-    t_end = _compute_t_end(cfg)
-    sparsifier = _get_sparsifier(cfg, optimizer, t_end)
 
-    if sparsifier is not None:
-        sparse_config = [
-            {"tensor_fqn": f"{fqn}.V"}
-            for fqn, module in c_model.named_modules()
-            if isinstance(module, SMLayer)
-        ]
-        sparsifier.prepare(c_model, sparse_config)
+    c_model.to(device)
 
     # INIT DDP
     if world_size > 1:
         c_model = DDPWrappedGetAttr(c_model, device_ids=[local_rank])
         c_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(c_model)
 
-    # WANDB LOGS RUN INIT
-    run = init_wandb(cfg, global_rank)
-    run_id = parse_wandb_run_id(run)
-
-    # EVAL PRIOR TRAINING
     step = 0
-    # START EFFICIENT TRAINING
-    train_validate(
+    c_model.eval()
+    perp = validate(
         cfg=cfg,
-        c_model=c_model,
         tokenizer=tokenizer,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        sparsifier=sparsifier,
-        original_model_activations=original_model_activations,
-        val_dataset=wikitext_test,
+        model=c_model,
+        dataset=wikitext_test,
         step=step,
         device=device,
     )
+    print(
+        f"Training Start - WikiText2 - Compressed Model Mean Perplexity: {perp['mean_perplexity']:.4f}"
+    )
+
+    c_model.train()
+    # GET ACTIVATIONS FOR DISTILLATION / EFFICIENT TRAINING
+    step = train_per_mlp(
+        cfg=cfg,
+        c_model=c_model,
+        original_model_activations=original_model_activations,
+        step=step,
+        device=device,
+    )
+    del original_model_activations
+    torch.cuda.empty_cache()
+
     validation_now = time.time()
     c_model.eval()
-    optimizer.zero_grad(set_to_none=True)
-    sparsifier.squash_mask()
-    del optimizer, scheduler, sparsifier, original_model_activations
-    torch.cuda.empty_cache()
     perp = validate(
         cfg=cfg,
         tokenizer=tokenizer,
@@ -172,7 +181,17 @@ def main(cfg: DictConfig):
         device=device,
     )
     wandb.log({"val_sec": time.time() - validation_now})
-    print(f"Training End - Mean Perplexity: {perp['mean_perplexity']:.4f}.")
+    print(
+        f"Training End - WikiText2 - Compressed Model Mean Perplexity: {perp['mean_perplexity']:.4f}."
+    )
+
+    for fqn, module in c_model.named_modules():
+        if isinstance(module, SMLayer):
+            param_count = module.V.numel()
+            zero_param_count = module.V.data.eq(0).sum().item()
+            print(
+                f"Post Training Sparsity for {fqn}: {zero_param_count/param_count:.4f}."
+            )
 
     if run is not None:
         # Only finish and save in global rank 0
@@ -182,12 +201,19 @@ def main(cfg: DictConfig):
         torch.cuda.synchronize()
 
     save_name = os.path.join(
-        "home/cem.uyuk/SparseDecompositions2Share/training/models/gemma2_2b/",
-        f"{cfg.model.save_name}_{run_id}_pb50.pt",
+        "./training/models/gemma2_2b/",
+        f"{cfg.model.save_name}_{run_id}_pb50.pth",
     )
-    os.makedirs(os.path.dirname(save_name), exist_ok=True)
+    # os.makedirs(os.path.dirname(save_name), exist_ok=True)
     print(f"Current working directory is: {os.getcwd()}")
-    torch.save(c_model.state_dict(), save_name)
+    # torch.save(c_model.state_dict(), save_name)
+    # Save the entire model and other necessary information
+    checkpoint = {
+        "state_dict": c_model.state_dict(),
+    }
+    # Specify the file path where you want to save the model
+    torch.save(checkpoint, save_name)
+
 
 def _define_blocks(cfg: DictConfig, model: nn.Module) -> List[nn.Module]:
     pattern = rf"{re.escape(cfg.model.kwargs.block_fqn_prefix)}\.\d+$"
@@ -199,9 +225,7 @@ def _define_blocks(cfg: DictConfig, model: nn.Module) -> List[nn.Module]:
 
 
 def _set_gradient_false(model: nn.Module) -> None:
-    for fqn, param in model.named_parameters():
-        if "pre_feedforward_layernorm" in fqn or "post_feedforward_layernorm" in fqn:
-            continue
+    for param in model.parameters():
         param.requires_grad = False
 
 
@@ -276,8 +300,7 @@ def _get_scheduler(
             f"Scheduler {cfg.optimizer.scheduler.name} not supported."
         )
     cfg.optimizer.scheduler.kwargs.T_max = (
-        cfg.training.num_epochs
-        * cfg.training.hooks.num_batches
+        cfg.training.num_epochs * cfg.training.hooks.num_batches
     )
     scheduler_class = getattr(
         torch.optim.lr_scheduler, cfg.optimizer.scheduler.name
@@ -391,6 +414,7 @@ def _get_sparsifier(
             distribution=UniformNMDistribution(n=n, m=m),
             optimizer=optimizer,
             random_mask_init=False,  # weights are pretrained, pick top magnitudes
+            init_method=None,  # critical to avoid overwriting decomposition init
             global_pruning=False,  # n/a for N:M sparsity
             n=n,
             m=m,
@@ -461,7 +485,6 @@ def _get_k_activations(
     seq_len = encodings.input_ids.size(1)
 
     for ctr, begin_loc in enumerate(range(0, seq_len, num_in_tokens)):
-        # for ctr, begin_loc in enumerate(range(0, len(dataset["text"]), num_in_tokens)):
         end_loc = min(begin_loc + num_in_tokens, seq_len)
         input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
 
@@ -490,125 +513,117 @@ def _get_k_activations(
     return results_dict
 
 
-def train_validate(
+def train_per_mlp(
     cfg: DictConfig,
     c_model: SMModel,
-    tokenizer: AutoTokenizer,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    sparsifier: Optional[DSTMixin],
     original_model_activations: Dict[str, torch.Tensor],
-    val_dataset: torch.utils.data.DataLoader,
     step: int,
     device: torch.device,
 ):
-    print("Starting training...")
-    world_size = get_world_size()
-    num_blocks = len(c_model.blocks)
-    per_mlp_avg_error = collections.defaultdict(float)
-
-    # Assumes all activations have the same batch size. Find shape from the 1st in/out tuple.
     n_samples = next(iter(original_model_activations.values()))[0].shape[0]
     n_steps = n_samples // cfg.data.batch_size
-    # validation_now = time.time()
-    # c_model.eval()
-    # perp = validate(
-    #     cfg=cfg,
-    #     tokenizer=tokenizer,
-    #     model=c_model,
-    #     dataset=val_dataset,
-    #     step=step,
-    #     device=device,
-    # )
-    # wandb.log({"val_sec": time.time() - validation_now})
-    # print(f"Training Start - Mean Perplexity: {perp['mean_perplexity']:.4f}.")
-    c_model.train()
-    for epoch in range(cfg.training.num_epochs):
-        permutation = np.random.permutation(n_samples)
-        # if epoch % cfg.training.validation_interval == 0:
-        #     validation_start =  time.time()
-        #     c_model.eval()
-        #     perp = validate(
-        #         cfg=cfg,
-        #         tokenizer=tokenizer,
-        #         model=c_model,
-        #         dataset=val_dataset,
-        #         step=step,
-        #         device=device,
-        #     )
-        #     print(
-        #         f"Epoch: {epoch}, Mean Perplexity: {perp['mean_perplexity']:.4f}"
-        #     )
-        #     wandb.log({"val_sec": time.time() - validation_start})
-        # c_model.train()
-        epoch_start = time.time()
-        sec_per_epoch = 0
-        avg_mlp_error = 0
-        epoch_start = time.time()
-        for i in tqdm(range(n_steps)):
-            step += 1
-            error = 0
-            avg_sec_per_step = 0
-            step_start = time.time()
-            start_id = i * cfg.data.batch_size
-            end_id = (i + 1) * cfg.data.batch_size
-            c_slice = permutation[start_id:end_id]
-            for mlp_key, (x_orig, y_orig) in original_model_activations.items():
-                x_orig = x_orig[c_slice].to(device)
-                y_orig = y_orig[c_slice].to(device)
-                compressed_mlp = c_model.get_submodule("model." + mlp_key).to(
-                    device
-                )
+    for mlp_key, (x, y) in original_model_activations.items():
+        optimizer_class = getattr(torch.optim, cfg.optimizer.name)
+        optimizer = optimizer_class(
+            c_model.get_submodule("model." + mlp_key).parameters(),
+            **cfg.optimizer.kwargs,
+        )
+        scheduler = _get_scheduler(cfg, optimizer)
+        t_end = _compute_t_end(cfg)
+        sparsifier = _get_sparsifier(cfg, optimizer, t_end)
+        # get the MLP layer in the config
+        sparse_config = [
+            {"tensor_fqn": f"model.{mlp_key}.up_proj.V"},
+            {"tensor_fqn": f"model.{mlp_key}.down_proj.V"},
+            {"tensor_fqn": f"model.{mlp_key}.gate_proj.V"},
+        ]
+        sparsifier.prepare(c_model, sparse_config)
+        per_mlp_avg_error = collections.defaultdict(float)
+        compressed_mlp = c_model.get_submodule("model." + mlp_key)
+        # Print GPU memory usage
+        gpu_mem_allocated = torch.cuda.memory_allocated(device) / (
+            1024**2
+        )  # Convert to MB
+        gpu_mem_reserved = torch.cuda.memory_reserved(device) / (
+            1024**2
+        )  # Convert to MB
+        print(
+            f"GPU Memory Allocated: {gpu_mem_allocated:.2f} MB, Reserved: {gpu_mem_reserved:.2f} MB"
+        )
+        for epoch in range(cfg.training.num_epochs):
+            permutation = np.random.permutation(n_samples)
+            epoch_start = time.time()
+            sec_per_epoch = 0
+            epoch_start = time.time()
+            for i in range(n_steps):
+                error = 0
+                step += 1
+                step_start = time.time()
+                avg_sec_per_step = 0
+
+                start_id = i * cfg.data.batch_size
+                end_id = (i + 1) * cfg.data.batch_size
+                c_slice = permutation[start_id:end_id]
+
+                x_orig = x[c_slice].to(device).detach()
+                y_orig = y[c_slice].to(device).detach()
                 y_compressed = compressed_mlp(x_orig)
-                temp_err = torch.nn.functional.mse_loss(y_compressed, y_orig)
+
+                error = torch.nn.functional.mse_loss(y_compressed, y_orig)
                 mlp_idx = mlp_key.split(".")[2]
-                per_mlp_avg_error[f"mlp_{mlp_idx}"] += temp_err.item()
-                error += temp_err
+                per_mlp_avg_error[f"mlp_{mlp_idx}"] += error.item()
 
-            error.backward()
+                error.backward()
+                if sparsifier is not None:
+                    sparsifier.step()
+
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+
+                error.detach_()
+                del x_orig, y_orig, y_compressed, error
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                avg_sec_per_step += time.time() - step_start
+
+            parameter_count = c_model.model_param_count()
+            sec_per_epoch = time.time() - epoch_start
+            avg_sec_per_step /= n_steps
+
+            per_mlp_avg_error = {
+                k: v / n_steps for k, v in per_mlp_avg_error.items() if v != 0
+            }
+            overall_mlp_avg_error = sum(per_mlp_avg_error.values()) / len(
+                per_mlp_avg_error
+            )
+            current_sparsity = 0
+            per_layer_sparsity = None
             if sparsifier is not None:
-                sparsifier.step()
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-            avg_mlp_error += error / num_blocks
-            avg_sec_per_step += time.time() - step_start
-
-        # Sync b/w distributed nodes
-        if world_size > 1:
-            for _, v in per_mlp_avg_error.items():
-                dist.all_reduce(v, dist.ReduceOp.SUM, async_op=False)
-            dist.all_reduce(avg_mlp_error, dist.ReduceOp.SUM, async_op=False)
-
-        avg_sec_per_step /= n_steps
-        sec_per_epoch = time.time() - epoch_start
-        per_mlp_avg_error = {
-            k: v / n_steps for k, v in per_mlp_avg_error.items() if v != 0
-        }
-        overall_mlp_avg_error = avg_mlp_error.item() / n_steps
-        current_sparsity = 0
-        per_layer_sparsity = None
-        if sparsifier is not None:
-            current_sparsity = sparsifier.sparsity
-            if sparsifier.global_pruning:
-                per_layer_sparsity = sparsifier.get_layerwise_sparsity()
-        parameter_count = c_model.model_param_count()
-
-        log_kwargs = {
-            "step": step,
-            "epoch": epoch,
-            "avg_sec_per_step": avg_sec_per_step,
-            "sec_per_epoch": sec_per_epoch,
-            "overall_mlp_avg_error": overall_mlp_avg_error,
-            "per_mlp_avg_error": per_mlp_avg_error,
-            "lr": optimizer.param_groups[0]["lr"],
-            "sparsity": current_sparsity,
-            "parameter_count": parameter_count,
-            "per_layer_sparsity": per_layer_sparsity,
-        }
-        wandb_llm_training_log(**log_kwargs)
-        print(f"Training Epoch: {epoch}, Avg. Blockwise Error: {avg_mlp_error}")
-    return
+                current_sparsity = sparsifier.sparsity
+                if sparsifier.global_pruning:
+                    per_layer_sparsity = sparsifier.get_layerwise_sparsity()
+            log_kwargs = {
+                "step": step,
+                "epoch": epoch,
+                "avg_sec_per_step": avg_sec_per_step,
+                "sec_per_epoch": sec_per_epoch,
+                "overall_mlp_avg_error": overall_mlp_avg_error,
+                "per_mlp_avg_error": per_mlp_avg_error,
+                "lr": optimizer.param_groups[0]["lr"],
+                "sparsity": current_sparsity,
+                "parameter_count": parameter_count,
+                "per_layer_sparsity": per_layer_sparsity,
+            }
+            wandb_llm_training_log(**log_kwargs)
+            print(
+                f"Training Epoch: {epoch}, Avg. Blockwise Error: {overall_mlp_avg_error}, Current Sparsity: {current_sparsity},"
+            )
+        optimizer.zero_grad(set_to_none=True)
+        sparsifier.squash_mask()
+        del scheduler, sparsifier, optimizer
+    return step
 
 
 def validate(
@@ -618,8 +633,9 @@ def validate(
     dataset: torch.utils.data.Dataset,
     step: int,
     device: torch.device,
+    log_wandb: bool = True,
 ):
-    batch_size = cfg.data.batch_size
+    batch_size = 2048
     encodings = tokenizer(
         "\n\n".join(dataset["text"]),
         return_tensors="pt",
@@ -659,12 +675,12 @@ def validate(
             )
 
             ppls += perplexity_batch.tolist()
-
-        wandb_llm_validation_log(
-            step=step,
-            perplexity=np.mean(ppls),
-        )
-        return {"perplexities": ppls, "mean_perplexity": np.mean(ppls)}
+        if log_wandb:
+            wandb_llm_validation_log(
+                step=step,
+                perplexity=np.mean(ppls),
+            )
+    return {"perplexities": ppls, "mean_perplexity": np.mean(ppls)}
 
 
 if __name__ == "__main__":

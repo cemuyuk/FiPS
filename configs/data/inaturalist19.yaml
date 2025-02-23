@@ -1,7 +1,7 @@
 name: inaturalist19
-directory: ./data/iNaturalist19/train_val2019/
+directory: ./data/iNaturalist19/
 num_classes: 1010
-batch_size: 256
+batch_size: 128
 num_workers: 8
 label_smoothing: 0.11
 record_top_5: True

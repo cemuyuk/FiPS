@@ -25,18 +25,21 @@ from omegaconf import DictConfig, OmegaConf
 
 from sparsimony.distributions.base import (
     UniformDistribution,
+    UniformNMDistribution,  # will warn if shapes are not supported by kernels
 )
 from sparsimony.schedulers.base import (
     CosineDecayScheduler,
     AcceleratedCubicScheduler,
+    AlwaysTrueScheduler,
 )
 from sparsimony.dst.base import DSTMixin
 from sparsimony.dst.static import (
     StaticMagnitudeSparsifier,
 )
-from sparsimony.dst.gmp import GMP
+from sparsimony.dst.gmp import GMP, SGMP
+from sparsimony.pruners.ste import SRSTESparsifier
 from sparsimony.dst.rigl import RigL
-from sparsimony.api import srigl_two_four
+from sparsimony.dst.srigl import NMSRigL
 
 from sd2s.lrm import SMLayer, SMModel
 from sd2s.utils import DDPWrappedGetAttr, get_world_size
@@ -55,7 +58,7 @@ from training.wandb_utils import (
 
 
 @hydra.main(
-    config_path=CONFIG_DIR, config_name="deit_base_config", version_base="1.3"
+    config_path=CONFIG_DIR, config_name="swin_base_config", version_base="1.3"
 )
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
@@ -225,22 +228,22 @@ def _get_datasets(
     assert "train" in transforms and "val" in transforms
     if cfg.data.name == "imagenet":
         train_dataset = datasets.ImageFolder(
-            os.path.join(cfg.paths.data.directory, cfg.paths.data.train),
+            os.path.join(cfg.data.directory, "train"),
             transform=transforms["train"],
         )
         val_dataset = datasets.ImageFolder(
-            os.path.join(cfg.paths.data.directory, cfg.paths.data.val),
+            os.path.join(cfg.data.directory, "val"),
             transform=transforms["val"],
         )
     elif cfg.data.name == "cifar100":
         train_dataset = datasets.CIFAR100(
-            root=cfg.paths.data.directory,
+            root=cfg.data.directory,
             train=True,
             transform=transforms["train"],
             download=False,
         )
         val_dataset = datasets.CIFAR100(
-            root=cfg.paths.data.directory,
+            root=cfg.data.directory,
             train=False,
             transform=transforms["val"],
             download=False,
@@ -414,7 +417,65 @@ def _get_sparsifier(
             global_pruning=cfg.sparsifier.global_pruning,
         )
     elif sparsifier_name == "srigl":
-        sparsifier = srigl_two_four(optimizer, t_end, delta_t, pruning_ratio)
+        m = 4
+        n = math.floor((1 - sparsity) * m)
+        sparsifier = NMSRigL(
+            scheduler=CosineDecayScheduler(
+                quantity=pruning_ratio,
+                t_end=t_end,
+                delta_t=delta_t,
+            ),
+            # set strict=True to skip bad layers
+            distribution=UniformNMDistribution(n=n, m=m),
+            optimizer=optimizer,
+            random_mask_init=False,  # weights are pretrained, pick top magnitudes
+            init_method=None,  # critical to avoid overwriting decomposition init
+            global_pruning=False,  # n/a for N:M sparsity
+            n=n,
+            m=m,
+            sparsity=sparsity,
+        )
+    elif sparsifier_name == "sgmp":
+        m = 4
+        n = math.floor((1 - sparsity) * m)
+        sparsifier = SGMP(
+            scheduler=AcceleratedCubicScheduler(
+                t_end=t_end,
+                delta_t=delta_t,
+                t_accel=t_accel,
+                initial_sparsity=initial_sparsity,
+                accelerated_sparsity=accelerated_sparsity,
+                final_sparsity=final_sparsity,
+            ),
+            # set strict=True to skip bad layers
+            distribution=UniformNMDistribution(n=n, m=m),
+            optimizer=optimizer,
+            random_mask_init=False,  # weights are pretrained, pick top magnitudes
+            init_method=None,  # critical to avoid overwriting decomposition init
+            global_pruning=False,  # n/a for N:M sparsity
+            n=n,
+            m=m,
+        )
+    elif sparsifier_name == "srste":
+        m = 4
+        n = math.floor((1 - sparsity) * m)
+        sparsifier = SRSTESparsifier(
+            scheduler=AlwaysTrueScheduler(),
+            distribution=UniformNMDistribution(n=n, m=m),
+            n=n,
+            m=m,
+            decay=2e-4,
+        )
+    elif sparsifier_name == "ste":
+        m = 4
+        n = math.floor((1 - sparsity) * m)
+        sparsifier = SRSTESparsifier(
+            scheduler=AlwaysTrueScheduler(),
+            distribution=UniformNMDistribution(n=n, m=m),
+            n=n,
+            m=m,
+            decay=None,
+        )
     else:
         raise ValueError(f"Sparsifier {cfg.sparsifier.name} not supported.")
     return sparsifier
@@ -566,7 +627,11 @@ def train_validate(
             if sparsifier is not None:
                 sparsifier.step()
                 current_sparsity = sparsifier.sparsity
-                if sparsifier.global_pruning:
+                if (
+                    not cfg.sparsifier.name == "srste"
+                    and not cfg.sparsifier.name == "ste"
+                    and sparsifier.global_pruning
+                ):
                     per_layer_sparsity = sparsifier.get_layerwise_sparsity()
 
             optimizer.step()

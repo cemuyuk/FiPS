@@ -25,35 +25,37 @@ def svd_decompose(
         U (`torch.tensor`), V (`torch.tensor`)
             The decomposed matrices where V is multiplied with the singular values S.
     """
+    original_device = weight_tensor.device
+    weight_tensor = weight_tensor.to("cpu")
     U, S, V = torch.linalg.svd(weight_tensor, full_matrices=False)
     diag_S = torch.diag(S)
     V = diag_S @ V
-
     d = min(U.shape[0], U.shape[1])
-
     if rank > d:
         k = rank - d
-
         device = weight_tensor.device
-
         new_U_neurons = torch.zeros(U.shape[0], k, device=device)
         new_V_neurons = V[:k, :] / tau
-
         U = torch.cat([U, new_U_neurons], dim=1)
         V = torch.cat([V, new_V_neurons], dim=0)
-
         while V.shape[0] < rank:
             V = torch.cat([V, new_V_neurons], dim=0)[:rank, :]
-
         return U, V
-
     U = U[:, :rank]
     V = V[:rank, :]
-
+    U.to(original_device)
+    V.to(original_device)
     return U, V
 
 
-def compute_sparse_r(n_blocks: int, d: int, p_budget: float, sparsity: float):
+def compute_sparse_r(
+    n_blocks: int,
+    d: int,
+    p_budget: float,
+    sparsity: float,
+    num_ffs: int,
+    rounding: bool = False,
+):
     """Returns rank of the model when initialized with n_blocks to be concatenated,
     model dimension d, parameter budget of FCs and sparsity.
     Args:
@@ -64,10 +66,12 @@ def compute_sparse_r(n_blocks: int, d: int, p_budget: float, sparsity: float):
     Returns:
         int: Rank of the compressed and sparse model.
     """
-    n_params = 8 * n_blocks * (d**2) * p_budget
-    f_coeff = 8 * d * n_blocks * (1 - sparsity) + d
-
-    return int(n_params / f_coeff)
+    n_params = 4 * num_ffs * n_blocks * (d**2) * p_budget
+    f_coeff = 4 * num_ffs * d * n_blocks * (1 - sparsity) + d
+    r = int(n_params / f_coeff)
+    if rounding:
+        r = 64 * (r // 64)
+    return r
 
 
 class DDPWrappedGetAttr(DistributedDataParallel):

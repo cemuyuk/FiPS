@@ -1,7 +1,7 @@
 name: flowers
 directory: ./data/Flowers102
 num_classes: 102
-batch_size: 256
+batch_size: 128
 num_workers: 8
 label_smoothing: 0.11
 record_top_5: True

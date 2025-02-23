@@ -221,3 +221,45 @@ def wandb_validation_log(
             }
         )
     wandb.log(log_data, step=step)
+
+
+def wandb_llm_training_log(
+    step: int,
+    epoch: int,
+    avg_sec_per_step: float,
+    sec_per_epoch: float,
+    per_mlp_avg_error: float,
+    overall_mlp_avg_error: float,
+    lr: float,
+    parameter_count: Optional[int],
+    sparsity: Optional[float] = 0,
+    per_layer_sparsity: Dict[str, float] = None,
+):
+    global_rank = int(os.environ.get("RANK", 0))
+    if global_rank != 0:
+        return
+    log_data = {
+        "epoch": epoch,
+        "avg_sec_per_step": avg_sec_per_step,
+        "sec_per_epoch": sec_per_epoch,
+        "overall_mlp_avg_error": overall_mlp_avg_error,
+        "lr": lr,
+        "sparsity": sparsity,
+        "parameter_count": parameter_count,
+    }
+    if per_layer_sparsity is not None:
+        log_data.update({"per_layer_sparsity": per_layer_sparsity})
+    log_data.update(per_mlp_avg_error)
+    wandb.log(log_data, step=step)
+
+
+def wandb_llm_validation_log(step: int, perplexity: float):
+    # Check if this proc. is controller.
+    # If not set, we are in single proc and should log
+    global_rank = int(os.environ.get("RANK", 0))
+    if global_rank != 0:
+        return
+    log_data = {
+        "perplexity": perplexity,
+    }
+    wandb.log(log_data, step=step)

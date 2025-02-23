@@ -1,0 +1,16 @@
+program: ./training/distil_llm_local.py
+method: grid
+project: SparseDecompositions2Share
+name: Gradual-AdamW-Gemma-Epoch-Batch-Sweep
+metric:
+  goal: maximize
+  name: perplexity
+parameters:
+  optimizer.kwargs.weight_decay: 
+    values: [1e-2, 1e-1, 1, 10, 100]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}

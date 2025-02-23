@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from omegaconf import DictConfig
 
-from sd2s.utils import svd_decompose
+from sd2s.utils import svd_decompose, compute_sparse_r
 
 
 class LRLayer(nn.Module):
@@ -29,6 +29,8 @@ class LRLayer(nn.Module):
 
         if bias is not None:
             self.bias = nn.Parameter(bias, requires_grad=True)
+        else:
+            self.bias = None
 
         self.U = nn.Parameter(U, requires_grad=True)
         self.V = nn.Parameter(V, requires_grad=True)
@@ -50,14 +52,20 @@ class LRModel(nn.Module):
 
         self._define_blocks(cfg)
         self._define_target_layers(cfg)
-        self._init_layers(cfg.rank)
+        rank = compute_sparse_r(
+            1,
+            self.blocks[0].mlp.gate_proj.in_features,
+            cfg.p_budget,
+            cfg.sparsity,
+            1,
+        )
+        self._init_layers(rank)
 
-    def forward(self, x: torch.tensor):
-        return self.model(x)
+    def forward(self, x: torch.tensor, *args, **kwargs):
+        return self.model(x, *args, **kwargs)
 
     def _define_blocks(self, cfg: DictConfig):
         pattern = rf"{re.escape(cfg.block_fqn_prefix)}\.\d+$"
-
         self.blocks = []
         for fqn, module in self.named_modules():
             if re.search(pattern, fqn):

@@ -1,6 +1,8 @@
-import math
 import os
+import time
+import math
 import dotenv
+import pathlib
 from typing import Optional, Tuple, List, Dict, Callable
 
 import wandb
@@ -62,16 +64,10 @@ from sd2s.utils import (
     get_world_size,
 )
 from SETTINGS import CONFIG_DIR
-from training.wandb_utils import (
-    init_wandb,
-    parse_wandb_run_id,
-    wandb_finetune_log,
-    wand_finetune_val_log,
-)
 
 
 @hydra.main(
-    config_path=CONFIG_DIR, config_name="deit_base_config", version_base="1.3"
+    config_path=CONFIG_DIR, config_name="swin_large_config", version_base="1.3"
 )
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
@@ -104,17 +100,9 @@ def main(cfg: DictConfig):
     c_model = _init_compressed_model(cfg)
     optimizer = _get_optimizer(cfg, c_model)
     total_steps = cfg.training.num_epochs * len(train_dataloader)
-    scheduler = _get_scheduler(cfg, optimizer, total_steps)
     sparsifier = _get_sparsifier(
         cfg, optimizer, _compute_t_end(cfg, total_steps), total_steps
     )
-
-    if cfg.data.mixup_active:
-        mixup_fn = _get_mixup_fn(cfg)
-        criterion = SoftTargetCrossEntropy()
-    else:
-        mixup_fn = None
-        criterion = nn.CrossEntropyLoss()
 
     c_model.to(device)  # To device before prepare for all_reduce on scores
     if sparsifier is not None:
@@ -126,49 +114,36 @@ def main(cfg: DictConfig):
         sparsifier.prepare(c_model, sparse_config)
     checkpoint_dict = torch.load(cfg.model.checkpoint_path)
     try:
-        checkpoint_dict = _load_checkpoint(c_model, checkpoint_dict)
+        checkpoint_dict = _load_checkpoint_v2(c_model, checkpoint_dict)
     except RuntimeError:
         checkpoint_dict = get_single_process_model_state_from_distributed_state(
             checkpoint_dict
         )
-        checkpoint_dict = _load_checkpoint(c_model, checkpoint_dict)
+        checkpoint_dict = _load_checkpoint_v2(c_model, checkpoint_dict)
 
     # INIT DDP
     if world_size > 1:
         c_model = DDPWrappedGetAttr(c_model, device_ids=[local_rank])
         c_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(c_model)
-    # WANBD, TRAINING, SAVE
-    run = init_wandb(cfg, global_rank)
-    run_id = parse_wandb_run_id(run)
     c_model.eval()
     print(f"The length of the test_dataset is {len(validation_dataset)}.")
     print(f"The lenght of test_dataloader is {len(validation_dataloader)}.")
     print(f"The length of the train_dataset is {len(train_dataset)}.")
     print(f"The lenght of train_dataloader is {len(train_dataloader)}.")
+
+    original_model = models.create_model(
+        cfg.model.name,
+        pretrained=False,
+        num_classes=cfg.data.num_classes,
+    )
+    original_model = original_model.to(device)
     _ = validate(
         cfg=cfg,
-        model=c_model,
+        model=original_model,
         dataloader=validation_dataloader,
         epoch=0,
         device=device,
     )
-    c_model.train()
-    train(
-        cfg=cfg,
-        model=c_model,
-        train_dataloader=train_dataloader,
-        test_dataloader=validation_dataloader,
-        mixup_fn=mixup_fn,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        sparsifier=sparsifier,
-        criterion=criterion,
-        epochs=cfg.training.num_epochs,
-        device=device,
-        run_id=run_id,
-    )
-    if run is not None:  # Global rank == 0
-        run.finish()
 
 
 def _get_device(cfg: DictConfig, local_rank: int) -> torch.device:
@@ -236,7 +211,23 @@ def _get_transforms_v1(
             ),
         ]
     )
-    return {"train": train_tsfm, "test": test_tsfm}
+    validation_transform = transforms.Compose(
+        [
+            transforms.Resize(cfg.data.transforms._RESIZE_X),
+            transforms.CenterCrop(
+                size=[
+                    cfg.data.transforms._IMAGE_WIDTH,
+                    cfg.data.transforms._IMAGE_HEIGHT,
+                ]
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=cfg.data.transforms._MEAN_RGB,
+                std=cfg.data.transforms._STDDEV_RGB,
+            ),
+        ]
+    )
+    return {"train": train_tsfm, "test": test_tsfm, "val": validation_transform}
 
 
 def _get_transforms(cfg: DictConfig) -> dict[str, transforms.Compose]:
@@ -301,7 +292,23 @@ def _get_transforms(cfg: DictConfig) -> dict[str, transforms.Compose]:
             ),
         ]
     )
-    return {"train": train_tsfm, "test": test_tsfm}
+    validation_transform = transforms.Compose(
+        [
+            transforms.Resize(cfg.data.transforms._RESIZE_X),
+            transforms.CenterCrop(
+                size=[
+                    cfg.data.transforms._IMAGE_WIDTH,
+                    cfg.data.transforms._IMAGE_HEIGHT,
+                ]
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=cfg.data.transforms._MEAN_RGB,
+                std=cfg.data.transforms._STDDEV_RGB,
+            ),
+        ]
+    )
+    return {"train": train_tsfm, "test": test_tsfm, "val": validation_transform}
 
 
 def _get_datasets(
@@ -339,13 +346,13 @@ def _get_datasets(
             root=cfg.data.directory,
             split="train",
             transform=transforms["train"],
-            download=False,
+            download=True,
         )
         val_dataset = datasets.Flowers102(
             root=cfg.data.directory,
             split="val",
             transform=transforms["test"],
-            download=False,
+            download=True,
         )
         # combine train and val datasets
         train_dataset = torch.utils.data.ConcatDataset(
@@ -362,13 +369,13 @@ def _get_datasets(
             root=cfg.data.directory,
             split="trainval",
             transform=transforms["train"],
-            download=False,
+            download=True,
         )
         test_dataset = datasets.OxfordIIITPet(
             root=cfg.data.directory,
             split="test",
             transform=transforms["test"],
-            download=False,
+            download=True,
         )
 
     elif cfg.data.name == "inaturalist19":
@@ -386,6 +393,15 @@ def _get_datasets(
     elif cfg.data.name == "fake_imagenet":
         train_dataset = FakeImageNetDataset()
         test_dataset = FakeImageNetDataset()
+    elif cfg.data.name == "imagenet":
+        train_dataset = datasets.ImageFolder(
+            os.path.join(cfg.data.directory, "train"),
+            transform=transforms["train"],
+        )
+        test_dataset = datasets.ImageFolder(
+            os.path.join(cfg.data.directory, "val"),
+            transform=transforms["val"],
+        )
     else:
         raise ValueError(f"Dataset {cfg.data.name} not supported.")
     return train_dataset, test_dataset
@@ -495,21 +511,6 @@ def _get_optimizer(cfg: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
     optimizer_class = getattr(torch.optim, cfg.optimizer.name)
     optimizer = optimizer_class(model.parameters(), **cfg.optimizer.kwargs)
     return optimizer
-
-
-def _get_scheduler(
-    cfg: DictConfig, optimizer: torch.optim.Optimizer, total_steps: int
-) -> torch.optim.lr_scheduler._LRScheduler:
-    if not hasattr(torch.optim.lr_scheduler, cfg.optimizer.scheduler.name):
-        raise ValueError(
-            f"Scheduler {cfg.optimizer.scheduler.name} not supported."
-        )
-    cfg.optimizer.scheduler.kwargs.T_max = total_steps
-    scheduler_class = getattr(
-        torch.optim.lr_scheduler, cfg.optimizer.scheduler.name
-    )
-    scheduler = scheduler_class(optimizer, **cfg.optimizer.scheduler.kwargs)
-    return scheduler
 
 
 def _compute_t_end(cfg: DictConfig, total_steps: int):
@@ -633,80 +634,6 @@ def _get_sparsifier(
     return sparsifier
 
 
-def train(
-    cfg: DictConfig,
-    model: nn.Module,
-    train_dataloader: DataLoader,
-    test_dataloader: DataLoader,
-    mixup_fn: Mixup,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    sparsifier: DSTMixin,
-    criterion: Callable,
-    epochs: int,
-    device: torch.device,
-    run_id: str,
-):
-    world_size = get_world_size()
-    step = 0
-    best_accuracy = 0
-    for epoch in range(epochs):
-        for _, (inputs, targets) in enumerate(train_dataloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            original_targets = (
-                targets.argmax(dim=1) if len(targets.shape) > 1 else targets
-            )
-            if mixup_fn is not None:
-                inputs, targets = mixup_fn(inputs, targets)
-            logits = model(inputs)
-            loss = criterion(logits, targets)
-            loss *= 2
-            loss.backward()
-            accuracy = (logits.argmax(1) == original_targets).float().mean()
-            if sparsifier is not None:
-                sparsifier.step()
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-
-            # Sync b/w distributed nodes
-            if world_size > 1:
-                # Sum reduction since we want per instance loss across world
-                dist.all_reduce(loss, dist.ReduceOp.SUM, async_op=False)
-                dist.all_reduce(accuracy, dist.ReduceOp.AVG, async_op=False)
-
-            wandb_finetune_log(
-                step,
-                loss.item() / (len(targets) * world_size),  # per instance loss
-                accuracy.item() * 100,
-                logits,
-                cfg.wandb.log_images,
-                inputs,
-                targets,
-                logits.argmax(1),
-            )
-            if int(os.environ.get("RANK", 0)) == 0:
-                print(
-                    f"Epoch {epoch+1}/{epochs}, Step: {step}, Train Loss: {loss.item()/(len(targets)*world_size)}"
-                )
-            step += 1
-        if (epoch + 1) % cfg.training.validation_interval == 0:
-            model.eval()
-            val_accuracy = validate(
-                cfg,
-                model,
-                test_dataloader,
-                (epoch + 1),
-                device,
-            )
-            if val_accuracy > best_accuracy:
-                save_name = os.path.join(
-                    cfg.paths.models, f"compressed_model_{run_id}.pt"
-                )
-                torch.save(model.state_dict(), save_name)
-            model.train()
-
-
 def validate(
     cfg: DictConfig,
     model: nn.Module,
@@ -721,10 +648,35 @@ def validate(
     top_5_correct = 0
     top_5_accuracy = None
     criterion = nn.CrossEntropyLoss()
+
+    total_inference_time = (
+        0  # To track total inference time for throughput calculation
+    )
+    total_validation_time = 0  # To track total time for the whole validation
+    num_batches = len(dataloader)  # Number of batches in the dataloader
+    batch_size = dataloader.batch_size  # Batch size from the dataloader
+
+    # Start the timer for the entire validation process
+    validation_start_time = time.time()
+
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader):
             inputs, targets = inputs.to(device), targets.to(device)
+
+            # Start the timer for inference (model forward pass)
+            start_time = time.time()
+
+            # Forward pass
             logits = model(inputs)
+
+            # End the timer for inference
+            end_time = time.time()
+
+            # Accumulate the time taken for this batch (inference)
+            batch_time = end_time - start_time
+            total_inference_time += batch_time
+
+            # Compute loss and accuracy
             loss += criterion(logits, targets)
             _, preds = torch.max(logits, 1)
             correct += preds.eq(targets.view_as(preds)).sum()
@@ -739,7 +691,6 @@ def validate(
 
         # Sync b/w distributed nodes
         if world_size > 1:
-            # Sum reduction since we want per instance metrics across world
             dist.all_reduce(loss, dist.ReduceOp.SUM, async_op=False)
             dist.all_reduce(correct, dist.ReduceOp.SUM, async_op=False)
             if cfg.data.record_top_5:
@@ -750,21 +701,27 @@ def validate(
         loss /= len(dataloader.dataset)  # avg. per instance loss
         accuracy = (correct / len(dataloader.dataset)) * 100
         top_5_accuracy = (top_5_correct / len(dataloader.dataset)) * 100
-    wand_finetune_val_log(
-        epoch,
-        loss.item(),
-        accuracy.item(),
-        logits,
-        cfg.wandb.log_images,
-        top_5_accuracy.item(),
-        inputs,
-        targets,
-        preds,
-    )
+
+    # End the timer for the entire validation process
+    validation_end_time = time.time()
+    total_validation_time = validation_end_time - validation_start_time
+
+    # Calculate throughput
+    throughput = (
+        batch_size * num_batches
+    ) / total_inference_time  # Inference throughput (samples per second)
+    print(f"Batch size: {batch_size}")
+    print(f"Number of batches: {num_batches}")
+
+    # Report metrics
     if int(os.environ.get("RANK", 0)) == 0:
         print(
             f"Epoch: {epoch}, Validation Loss: {loss}, Accuracy: {accuracy}, Top 5 Accuracy: {top_5_accuracy}"
         )
+        print(f"Total Inference Time: {total_inference_time:.4f} seconds")
+        print(f"Total Validation Time: {total_validation_time:.4f} seconds")
+        print(f"Throughput: {throughput:.2f} samples per second")
+
     return accuracy
 
 

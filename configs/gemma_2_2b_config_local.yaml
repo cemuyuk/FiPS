@@ -1,60 +1,57 @@
-defaults:
-  - data: imagenet
-  - _self_
-
 hydra:
   run:
     dir: ./artefacts/hydra_outputs
 
 training: 
-  num_epochs: 20
+  num_epochs: 40
   use_cuda: True
   task: ImageClassification
   seed: 7
   validation_interval: 2
   hooks:
-    in_place: False
+    in_place: True
     single: False
-    embedding_key: norm_pre
-    fqn_prefix: blocks
-    num_batches: 30
+    embedding_key: embed_tokens
+    fqn_prefix: layers
+    num_batches: 20
     batch_train: True
-    optimal_steps: 600
-
+    optimal_steps: 800
 
 model:
-  name: swin_large_patch4_window7_224
+  name: google/gemma-2-2b
+  save_name: gemma2_2b
   pretrained: True
-  path: ./training/models/swin_large_patch4_window7_224.pth
-  checkpoint_path: ./training/models/swin_l_pb40.pt
+  path: ./ # ${oc.env:SLURM_TMPDIR}/models/deit_base_patch16_224.pth
+  checkpoint_path: ./
   kwargs:
-    p_budget: 0.4
-    sparsity: 0.75
+    p_budget: 0.60
+    sparsity: 0
+    structured_sparsity: False
     emb_fqn: patch_embed
-    block_fqn_prefix: blocks
-    layer_fqn_suffixes: [fc1, fc2]
+    block_fqn_prefix: layers
+    layer_fqn_suffixes: [up_proj, down_proj, gate_proj]
     normalization:
-      in_place: True
-      fqn: downsample
-      apply_before_idx: [0, 2, 4, 22]
+      in_place: False
+      fqn: None
+      apply_before_idx: None
     block_group_indices:
       block_group_1: [0, 1]
-      block_group_2: [2, 3]
-      block_group_3: [4, 5, 6, 7, 8, 9]
-      block_group_4: [10, 11, 12, 13, 14, 15]
-      block_group_5: [16, 17, 18, 19, 20, 21]
-      block_group_6: [22, 23]
+      block_group_2: [2, 3, 4, 5]
+      block_group_4: [6, 7, 8, 9]
+      block_group_5: [10, 11, 12, 13]
+      block_group_6: [14, 15, 16, 17]
+      block_group_7: [18, 19, 20, 21]
+      block_group_8: [22, 23, 24, 25]
     concat_axis: 1
     mask: True
     base_requires_grad: True
-
 
 optimizer:
   name: AdamW
   label_smoothing: 0.11
   kwargs:
-    lr: 1.0e-3
-    weight_decay: 0.05
+    lr: 1.0e-5 # effectively this is 1e-4
+    weight_decay: 0.1
     betas: [0.9, 0.999]
     eps: 9.999e-9 # effectively this is 1e-8
     amsgrad: False
@@ -64,32 +61,48 @@ optimizer:
       T_max: 400 # being overriden in main.py
       eta_min: 1.0e-6  # effectively this is 1e-6
 
-
 sparsifier:
-  name: rigl
+  name: gradual
   sparsity: 0.75
+  global_pruning: True
   grown_weights_init: 0
   pruning_ratio: 0.1
-  t_accel: 240
+  t_accel: 200
   initial_sparsity: 0.05
   final_sparsity: 0.75
   accelerated_sparsity: 0.5
-  global_pruning: True
   scheduler:
     delta_t: 50
     t_end_coeff: 0.75
 
+# TODO - check clip grad norm
+data:
+  name: redpajama
+  batch_size: 8192
+  num_workers: 2
+
 wandb:
   ENABLE: True # Global switch for turning all wandb calls into no-ops, see ./src/package/utils/wandb_utils.py
   run_id: null # Keep null for fresh runs, otherwise, set to run_id to load ckpt
-  name: ${model.name}-${sparsifier.name}-${data.name}-Finetune
+  name: ${model.name}-dense-${optimizer.kwargs.lr}-pb60-local
   project: SparseDecompositions2Share
   entity: cem1
   start_method: thread
   log_images: False # If True, log images when relevant to ML task
 
 paths:
+  data: 
+    directory: ./data/ImageNet/ # ${oc.env:SLURM_TMPDIR}
+    train: train
+    val: val
   artefacts: ./artefacts/
   logs: ${paths.artefacts}/logs/
   models: ${paths.artefacts}/models/
   
+benchmarking:
+  latency: False
+  inference_profiling: True
+  training_profiling: False
+  param_budget: 0.90
+  compressed: True
+  compiled: False
