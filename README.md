@@ -1,5 +1,5 @@
 # FiPS (Fine-grained Parameter Sharing)
-## Paper: Learning Parameter Sharing with Tensor Decompositions and Sparsity
+## Paper: Learning Fine-grained Parameter Sharing via Sparse Tensor Decomposition
 https://arxiv.org/abs/2411.09816
 
 Research on model compression, efficient training and fine-tuning via parameter sharing, sparsity, and tensor decomposition.
